@@ -1,0 +1,23 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {sample,analyseCSV,buildPrompt,reviewDraft,validateBrief,workflows} from '../docs/core.js';
+import {createServer} from '../server.js';
+test('calculates weighted totals without invented savings',()=>{const a=analyseCSV(sample.csv);assert.equal(a.tickets,500);assert.ok(Math.abs(a.hours-148.66666666666666)<0.000001);assert.equal(a.averageMinutes,17.84);});
+test('rejects malformed, negative, empty and non-finite numeric data',()=>{for(const row of ['Access,-1,12','Access,2,Infinity','Access,,12','Access,1.5,12','Access,2,-5'])assert.throws(()=>analyseCSV(`category,tickets,minutes_per_ticket\n${row}`));});
+test('all workflows use supplied evidence and explicit human review',()=>{for(const key of Object.keys(workflows)){const p=buildPrompt(sample,key);assert.match(p.system,/untrusted data/);assert.match(p.system,/human review/);assert.match(p.user,/S1/);assert.match(p.user,/Northstar/);}});
+test('ledger validation rejects duplicate IDs and unsafe URLs',()=>{assert.throws(()=>validateBrief({...sample,sources:[sample.sources[0],sample.sources[0]]}));assert.throws(()=>validateBrief({...sample,sources:[{...sample.sources[0],url:'javascript:alert(1)'}]}));});
+test('review flags unknown citations, placeholders, identifiers and credentials',()=>{const results=reviewDraft('Draft [S9] [TO CONFIRM] user@example.com sk-abcdefghijklmnop',sample);for(const phrase of ['Citation S9','placeholders','identifier','credential'])assert.ok(results.some(x=>x.message.includes(phrase)));});
+test('valid citations retain the human review requirement',()=>{assert.ok(reviewDraft('The CIO approved discovery [S1].',sample).some(x=>x.level==='manual'));});
+test('service blocks sensitive requests before model calls, checks origin, and drafts valid requests',async t=>{
+ let calls=0;
+ const server=createServer(async(url,options)=>{calls++;assert.equal(url,'http://127.0.0.1:11434/api/chat');const body=JSON.parse(options.body);assert.equal(body.stream,false);assert.equal(body.messages[0].role,'system');return new Response(JSON.stringify({message:{content:'Discovery only is approved [S1].'}}),{status:200,headers:{'Content-Type':'application/json'}});});
+ await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));t.after(()=>server.close());const url=`http://127.0.0.1:${server.address().port}`;
+ const post=(data,headers={})=>fetch(url+'/api/draft',{method:'POST',headers:{'Content-Type':'application/json',...headers},body:JSON.stringify(data)});
+ const payload={brief:sample,workflow:'report',model:'phi4'};
+ assert.equal((await post({...payload,brief:{...sample,classification:'restricted'},approvedSensitive:true})).status,403);
+ assert.equal((await post({...payload,brief:{...sample,classification:'confidential'}})).status,403);
+ assert.equal((await post(payload,{Origin:'https://evil.example'})).status,403);
+ assert.equal(calls,0);
+ const response=await post(payload);assert.equal(response.status,200);assert.equal((await response.json()).draft,'Discovery only is approved [S1].');assert.equal(calls,1);
+ assert.equal((await fetch(url+'/../package.json')).status,404);
+});
